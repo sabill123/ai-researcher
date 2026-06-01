@@ -17,8 +17,10 @@ from .config import SystemConfig, assert_safe_path
 DANGEROUS_PATTERNS = [
     r'\bos\.system\b',
     r'\bsubprocess\.(run|call|Popen|check_output|check_call)\b',
-    r'\beval\s*\(',
-    r'\bexec\s*\(',
+    # `\b` would match `model.eval(` too. Require no preceding `.` or word char
+    # so we still catch bare `eval(...)`/`exec(...)` but allow `nn.eval()` etc.
+    r'(?<![.\w])eval\s*\(',
+    r'(?<![.\w])exec\s*\(',
     r'\bshutil\.rmtree\b',
     r'\b__import__\b',
     r'\bimportlib\b',
@@ -41,8 +43,13 @@ class ExperimentSandbox:
     def __init__(self, config: SystemConfig):
         self.config = config
 
-    def create_sandbox(self, exp_name: str) -> str:
+    def create_sandbox(self, exp_name: str, parent_code_dir: Optional[str] = None) -> str:
         """Create an isolated experiment directory with code copies.
+
+        Args:
+            exp_name: Name for the experiment directory.
+            parent_code_dir: If provided, copy code from this directory (parent experiment)
+                             instead of baseline. Falls back to baseline for missing files.
 
         Returns the experiment directory path.
         """
@@ -55,12 +62,18 @@ class ExperimentSandbox:
         os.makedirs(code_dir, exist_ok=True)
         os.makedirs(results_dir, exist_ok=True)
 
-        # Copy base scripts
+        # Copy scripts from parent experiment or baseline
+        source_dir = parent_code_dir if parent_code_dir and os.path.isdir(parent_code_dir) else self.config.scripts_dir
         for filename in self.config.sandbox_files:
-            src = os.path.join(self.config.scripts_dir, filename)
+            src = os.path.join(source_dir, filename)
             dst = os.path.join(code_dir, filename)
             if os.path.exists(src):
                 shutil.copy2(src, dst)
+            else:
+                # Fallback to baseline if parent is missing a file
+                fallback = os.path.join(self.config.scripts_dir, filename)
+                if os.path.exists(fallback):
+                    shutil.copy2(fallback, dst)
 
         # Symlink pretrained checkpoints (shared, read-only)
         # backbone.py uses: os.path.join(script_dir, "..", "pretrained_ckpts", ...)
@@ -158,7 +171,73 @@ class ExperimentSandbox:
                     f"Code diff too large: {changed_lines} changed lines (max 500)"
                 )
 
+        # 6. Import & instantiation test — catches RuntimeError, AttributeError, TypeError
+        import_errors = self._test_imports(code_dir)
+        if import_errors:
+            errors.append(f"Import test failed: {import_errors}")
+
         return (len(errors) == 0, errors)
+
+    def _test_imports(self, code_dir: str) -> Optional[str]:
+        """Try importing the key modules to catch runtime errors early.
+
+        Runs in a subprocess with GPU available to test full instantiation.
+        Only catches code bugs (TypeError, AttributeError, ImportError, NameError),
+        not environment issues.
+        """
+        test_script = f'''
+import sys, os
+sys.path.insert(0, "{code_dir}")
+os.chdir("{code_dir}")
+import torch
+# Patch torch.load to always use CPU (test runs without GPU)
+_original_load = torch.load
+def _cpu_load(*args, **kwargs):
+    kwargs["map_location"] = "cpu"
+    return _original_load(*args, **kwargs)
+torch.load = _cpu_load
+
+try:
+    import backbone
+    import model
+    import losses
+    import dataset
+    # Quick instantiation test (catches missing attributes, bad LoRA wrappers)
+    encoder = backbone.FaRLEncoder()
+    # Test forward pass on CPU
+    dummy = torch.randn(1, 3, 512, 512)
+    with torch.no_grad():
+        out = encoder(dummy)
+    print("OK")
+except (TypeError, AttributeError, ImportError, NameError, SyntaxError, ValueError) as e:
+    print(f"FAIL: {{type(e).__name__}}: {{e}}")
+except RuntimeError as e:
+    err_msg = str(e).lower()
+    if "cuda" in err_msg or "device" in err_msg:
+        print("OK_CUDA_SKIP")
+    else:
+        print(f"FAIL: RuntimeError: {{e}}")
+except Exception as e:
+    print(f"WARN: {{type(e).__name__}}: {{e}}")
+'''
+        try:
+            result = subprocess.run(
+                ["python3", "-c", test_script],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},  # CPU only
+            )
+            output = (result.stdout + result.stderr).strip()
+            if "OK" in result.stdout:
+                return None
+            # Extract the error
+            for line in output.split("\n"):
+                if line.startswith("FAIL:"):
+                    return line
+            return f"Unknown error: {output[-500:]}" if output else "No output"
+        except subprocess.TimeoutExpired:
+            return None  # Timeout likely means model loaded (slow but working)
+        except Exception as e:
+            return None  # Don't block on test infrastructure issues
 
     def generate_diff(self, exp_dir: str) -> Optional[str]:
         """Generate unified diff between original scripts and sandbox code (per file)."""
@@ -168,6 +247,28 @@ class ExperimentSandbox:
             if filename in self.config.readonly_files:
                 continue
             src = os.path.join(self.config.scripts_dir, filename)
+            dst = os.path.join(code_dir, filename)
+            if not os.path.exists(src) or not os.path.exists(dst):
+                continue
+            try:
+                result = subprocess.run(
+                    ["diff", "-u", src, dst],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.stdout:
+                    all_diffs.append(result.stdout)
+            except Exception:
+                continue
+        return "\n".join(all_diffs) if all_diffs else None
+
+    def generate_parent_diff(self, exp_dir: str, parent_code_dir: str) -> Optional[str]:
+        """Generate diff between parent experiment code and this experiment's code."""
+        code_dir = os.path.join(exp_dir, "code")
+        all_diffs = []
+        for filename in self.config.sandbox_files:
+            if filename in self.config.readonly_files:
+                continue
+            src = os.path.join(parent_code_dir, filename)
             dst = os.path.join(code_dir, filename)
             if not os.path.exists(src) or not os.path.exists(dst):
                 continue

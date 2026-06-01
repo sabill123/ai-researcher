@@ -3,11 +3,12 @@ Agent 1: Researcher
 Searches for papers and techniques, extracts implementable ideas.
 """
 
-import json
-import re
 from typing import Any, Dict, List, Optional
 
-from .base_agent import call_claude_cli
+from ..utils.logging_setup import get_logger
+from .base_agent import call_claude_cli, parse_json_response
+
+logger = get_logger(__name__)
 
 
 class ResearcherAgent:
@@ -33,21 +34,25 @@ class ResearcherAgent:
             existing_insights, completed_techniques,
         )
 
-        print("  [Researcher] Searching for techniques...")
+        logger.info("[Researcher] Searching for techniques...")
         response = call_claude_cli(
             prompt=prompt,
             model=self.model,
             max_budget_usd=self.max_budget_usd,
-            timeout_seconds=300,
+            # 2026-05-31: 300s timeout caused ~400 timeouts over recent
+            # ~500-iter run. Researcher does web search + LLM analysis which
+            # can take 5-10 min. Raised to 900s.
+            timeout_seconds=900,
             tools=None,  # Enable all tools (web search)
             system_prompt=self._system_prompt(),
+            agent="researcher",
         )
 
         if not response:
-            print("  [Researcher] No response")
+            logger.warning("[Researcher] No response")
             return None
 
-        return self._parse_response(response)
+        return self._parse_response(str(response))
 
     def _system_prompt(self) -> str:
         return """You are a research assistant for facial palsy severity prediction using deep learning.
@@ -135,19 +140,8 @@ Return ONLY this JSON:
         return prompt
 
     def _parse_response(self, response: str) -> Optional[Dict[str, Any]]:
-        text = response.strip()
-        # Try to find JSON object
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if not match:
-            print("  [Researcher] Could not parse JSON from response")
+        data = parse_json_response(response, expected_keys=("techniques",))
+        if data is None:
+            logger.warning("[Researcher] Could not parse JSON from response")
             return None
-
-        try:
-            data = json.loads(match.group())
-            if "techniques" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
-
-        print("  [Researcher] Invalid JSON in response")
-        return None
+        return data
